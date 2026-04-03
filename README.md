@@ -2,7 +2,7 @@
 
 A self-gated post-training framework for autonomous knowledge acquisition in language models.
 
-Autolearn enables language models to *learn from what they read*—selectively, verifiably, and without external supervision. It detects what a model does not already know (via surprisal), verifies new content against existing knowledge (via self-generated Q&A chains), and commits verified knowledge to parametric weights at a strength proportional to conviction depth (via per-item β₂ adjustment of AdamW).
+Autolearn enables language models to *learn from what they read*—selectively, verifiably, and without external supervision. It detects what a model does not already know (via surprisal), verifies[...]  
 
 **Paper**: [Autolearn: Learn by Surprise, Commit by Proof](https://arxiv.org/abs/2604.01951)
 
@@ -10,11 +10,11 @@ Autolearn enables language models to *learn from what they read*—selectively, 
 
 Autolearn operates in three stages:
 
-**Stage 1 — Detect and Ground.** Compute per-token surprisal for each passage. Flag passages exceeding a threshold (μ + λσ) as surprising. This is a single forward pass with zero additional cost.
+**Stage 1 — Detect and Ground.** Compute per-token surprisal for each passage. Flag passages exceeding a threshold (μ + λσ) as surprising. This is a single forward pass with zero additional c[...]  
 
-**Stage 2 — Verify, Grade and Annotate.** For each flagged passage, generate a Q&A chain tagged by epistemic origin (`[existing]`, `[mechanism]`, `[implication]`). Check each answer against the model's existing knowledge. The number of verified steps becomes the conviction depth *k*.
+**Stage 2 — Verify, Grade and Annotate.** For each flagged passage, generate a Q&A chain tagged by epistemic origin (`[existing]`, `[mechanism]`, `[implication]`). Check each answer against the [...]  
 
-**Stage 3 — Gated Weight Update.** Adjust AdamW's β₂ proportionally to *k* via β₂ = 0.999 · rᵏ. When *k* = 0, β₂ = 0.999 (standard AdamW, no learning). As *k* increases, β₂ decreases, progressively opening the Variance Lock. A single parameter *r* governs the entire learning intensity.
+**Stage 3 — Gated Weight Update.** Adjust AdamW's β₂ proportionally to *k* via β₂ = 0.999 · rᵏ. When *k* = 0, β₂ = 0.999 (standard AdamW, no learning). As *k* increases, β₂ decrea[...]  
 
 ## Key Results
 
@@ -38,10 +38,10 @@ pip install mlx mlx-lm numpy matplotlib
 ## Repository Structure
 
 ```
-Autolearn1.py          # Stage 1: Detect and Ground (surprisal computation)
-Autolearn2_1.py        # Stage 2-1: Q&A Chain Generation (auto source window)
-Autolearn2_2.py        # Stage 2-2: Consistency Checking
-Autolearn3.py          # Stage 3: Gated Weight Update (training + evaluation)
+lscp1.py           # Stage 1: Detect and Ground (surprisal computation)
+lscp2_1.py         # Stage 2-1: Q&A Chain Generation (auto source window)
+lscp2_2.py         # Stage 2-2: Consistency Checking
+lscp3.py           # Stage 3: Gated Weight Update (training + evaluation)
 config.py          # Model configuration, paths, hyperparameters
 passages.py        # Test corpus (60 passages: 20 known, 20 novel, 20 corrupt)
 paraphrases.py     # Semantically equivalent paraphrases for perturbation gap
@@ -62,16 +62,16 @@ RESULTS_DIR = Path("results")
 
 ```bash
 # Stage 1: Detect surprising passages
-python3 Autolearn1.py
+python3 lscp1.py
 
 # Stage 2-1: Generate Q&A chains
-python3 Autolearn2_1.py
+python3 lscp2_1.py
 
 # Stage 2-2: Consistency checking
-python3 Autolearn2_2.py
+python3 lscp2_2.py
 
 # Stage 3: Gated weight update (default r=0.98)
-python3 Autolearn3.py 0.98
+python3 lscp3.py 0.98
 ```
 
 ### 3. No-Passage Ablation
@@ -79,7 +79,7 @@ python3 Autolearn3.py 0.98
 To train on Q&A pairs only (without source window text):
 
 ```bash
-python3 Autolearn3.py --no-passage 0.95
+python3 lscp3.py --no-passage 0.95
 ```
 
 ## Configuration
@@ -108,7 +108,7 @@ Stage 3 produces `stage3_results_r{R}.json` containing:
 ## Citation
 
 ```bibtex
-@article{choi2026Autolearn,
+@article{choi2026auto,
   title={Autolearn: Learn by Surprise, Commit by Proof},
   author={Choi, Kang-Sin},
   year={2026}
