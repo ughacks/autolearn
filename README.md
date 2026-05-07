@@ -41,19 +41,14 @@ autolearn/
 ├── config.py                  # Model, LoRA, and training configuration
 ├── passages.py                # 60 passages (20 novel, 20 corrupt, 20 known)
 ├── paraphrases.py             # Semantically equivalent paraphrases for perturbation gap
-│
 ├── lscp1.py                   # Stage 1: Surprisal-based detection
 ├── lscp2_1.py                 # Stage 2: Q&A chain generation
 ├── lscp2_2.py                 # Stage 2: Consistency checking + conviction depth
-│
 ├── lscp3_1.py                 # Stage 3: Baseline (pre-trained adapter initialization)
 ├── lscp3_2.py                 # Stage 3: SFT (standard fine-tuning on raw text)
 ├── lscp3_3.py                 # Stage 3: Autolearn (Q&A training with gated weight update)
 ├── lscp3_eval.py              # Factual evaluation (perturbation gap + PPL + keyword D.Cor)
-│
 ├── test_qa_v2.py              # 78 test questions (5 categories, demonstration
-│
-│
 └── results/                   # Output directory for adapters and metrics
 ```
 
