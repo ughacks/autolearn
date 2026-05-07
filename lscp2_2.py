@@ -1,9 +1,11 @@
 """
-LSCP Stage 2-2: Consistency Check & Scoring
-=================================================
+LSCP Stage 2-2: Consistency Check & Scoring — DGX Spark Edition
+=================================================================
 Checks each Q&A pair against model's existing knowledge.
-Partial accept: all passages with k>0 produce training items.
+Graduated accept: all passages with k>0 produce training items.
 Strangeness: uncertainty-framed learning at break points.
+
+Backend: PyTorch + Transformers + bitsandbytes (CUDA)
 
 INPUT:  {RESULTS_DIR}/stage2_qa_chains.json
 OUTPUT: {RESULTS_DIR}/stage2_results.json
@@ -17,56 +19,73 @@ Usage:
 import time, json, re, numpy as np
 from pathlib import Path
 from collections import Counter
+import torch
 from config import *
-
-# -- Config --------------------------------------------------------
 
 CHAINS_FILE = RESULTS_DIR / "stage2_qa_chains.json"
 OUTPUT_FILE = RESULTS_DIR / "stage2_results.json"
 
 GROUND_TRUTH_LABEL = {"novel": True, "corrupt": False, "known": True}
 
-# -- Model Loading -------------------------------------------------
+
+# ── Model ─────────────────────────────────────────────────────────
 
 def load_model():
-    from mlx_lm import load
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
     print(f"  Loading {MODEL_NAME}...")
-    model, tokenizer = load(MODEL_NAME)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=DTYPE,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        dtype=DTYPE,
+    )
+
     if ADAPTER_PATH and Path(ADAPTER_PATH).exists():
-        import mlx.core as mx
-        try:
-            from mlx_lm.tuner.utils import linear_to_lora_layers
-        except ImportError:
-            from mlx_lm.tuner import linear_to_lora_layers
-        linear_to_lora_layers(model, 8, {"rank": 8, "scale": 20.0, "dropout": 0.0})
-        model.load_weights(list(mx.load(str(ADAPTER_PATH)).items()), strict=False)
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, ADAPTER_PATH)
         print(f"  Adapter loaded: {ADAPTER_PATH}")
     else:
         print(f"  Base model (no adapter)")
+
+    model.eval()
     return model, tokenizer
 
-# -- Generation ----------------------------------------------------
+
+# ── Generation ────────────────────────────────────────────────────
 
 def _strip_think_blocks(text):
     """Remove Qwen3 <think>...</think> blocks from generated text."""
-    import re
     text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
     text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
     return text.strip()
 
+
 def gen(model, tokenizer, prompt, max_tokens=512, temperature=0.7):
-    from mlx_lm import generate
-    try:
-        from mlx_lm.sample_utils import make_sampler
-        sampler = make_sampler(temp=temperature)
-        resp = generate(model, tokenizer, prompt=prompt,
-                        max_tokens=max_tokens, sampler=sampler, verbose=False)
-    except (ImportError, TypeError):
-        resp = generate(model, tokenizer, prompt=prompt,
-                        max_tokens=max_tokens, verbose=False)
+    """Generate text using transformers .generate()."""
+    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=max(temperature, 1e-4),  # avoid 0 for do_sample
+            do_sample=(temperature > 0.01),
+            top_p=0.9,
+        )
+    resp = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:],
+                            skip_special_tokens=True)
     return _strip_think_blocks(resp)
 
-# -- Consistency Check ---------------------------------------------
+
+# ── Consistency Check ─────────────────────────────────────────────
 
 CONSISTENCY_PROMPT = '''You are checking whether an answer is acceptable given the type of question.
 The question is tagged with its epistemic origin. Use the tag to decide how to evaluate.
@@ -114,12 +133,12 @@ Q: {tag_q}
 A: {a}
 Reasoning:'''
 
+
 def check_consistency(model, tokenizer, q, a, tag="mechanism"):
     tag_q = f"[{tag}] {q}"
     prompt = CONSISTENCY_PROMPT.format(tag_q=tag_q, a=a)
     resp = gen(model, tokenizer, prompt, max_tokens=500, temperature=0.1)
 
-    import re
     m = re.search(r'[Vv]erdict\s*:\s*(PASS|FAIL|pass|fail)', resp)
     if m:
         passed = m.group(1).upper() == "PASS"
@@ -133,10 +152,8 @@ def check_consistency(model, tokenizer, q, a, tag="mechanism"):
 
     return False, resp, "no_signal"
 
-# -- Helpers -------------------------------------------------------
 
-
-# -- Process One Passage -------------------------------------------
+# ── Process One Passage ──────────────────────────────────────────
 
 def process_passage(model, tokenizer, chain_entry, stage1_result):
     topic = chain_entry["topic"]
@@ -154,7 +171,7 @@ def process_passage(model, tokenizer, chain_entry, stage1_result):
     chain_results = []
     existing_fails = 0
 
-    # stage2-1 may have overproduced questions more than n_qa. then truncate
+    # Truncate to n_qa_requested if overproduced
     pairs = pairs[:chain_entry.get("n_qa_requested", len(pairs))]
 
     for i, pair in enumerate(pairs):
@@ -187,17 +204,15 @@ def process_passage(model, tokenizer, chain_entry, stage1_result):
     # Outcome
     checked_count = len(chain_results)
     is_full_chain = (break_point is None and k > 0)
-    has_learning = (k > 0)  # any passed Q&A → learn proportionally
+    has_learning = (k > 0)
     gt = GROUND_TRUTH_LABEL.get(label)
     correct = (is_full_chain if gt else not is_full_chain) if gt is not None else None
-
-    # Source window: store topic pointer only.
-    # lscp3.py resolves the actual text from passages.py + stage1 peaks.
 
     # Build training data + strangeness
     accepted_pairs = []
     strangeness = None
-    k_running = 0  # cumulative PASS count as we walk the chain
+    k_running = 0
+
     for cr in chain_results:
         if cr["passed"]:
             k_running += 1
@@ -214,9 +229,8 @@ def process_passage(model, tokenizer, chain_entry, stage1_result):
         elif not cr["passed"] and cr.get("tag") in ("mechanism", "implication"):
             # Extract reasoning from consistency check response
             reasoning = cr.get("response_preview", "")
-            # Strip verdict line if present
-            import re as _re
-            reasoning = _re.sub(r'[Vv]erdict\s*:\s*(PASS|FAIL|pass|fail).*', '', reasoning).strip()
+            reasoning = re.sub(r'[Vv]erdict\s*:\s*(PASS|FAIL|pass|fail).*', '',
+                               reasoning).strip()
 
             # Build uncertainty-framed strangeness for learning
             uncertainty_answer = (
@@ -274,7 +288,8 @@ def process_passage(model, tokenizer, chain_entry, stage1_result):
         "time_sec": round(time.time() - t_start, 1),
     }
 
-# -- Plotting ------------------------------------------------------
+
+# ── Plotting ──────────────────────────────────────────────────────
 
 def plot_all(all_detail):
     try:
@@ -289,25 +304,28 @@ def plot_all(all_detail):
     fig, ax = plt.subplots(figsize=(12, max(6, len(all_detail) * 0.4)))
     bar_c = ["#4CAF50" if is_accept(d) else "#F44336" for d in all_detail]
     y = range(len(all_detail))
-    rates = [d["n_passed"]/d["n_generated"] if d["n_generated"]>0 else 0 for d in all_detail]
+    rates = [d["n_passed"] / d["n_generated"] if d["n_generated"] > 0 else 0
+             for d in all_detail]
     ax.barh(y, rates, color=bar_c, alpha=0.7, height=0.7)
     for i, d in enumerate(all_detail):
         brk = f" brk@{d['break_point']}" if d["break_point"] is not None else ""
         ax.text(rates[i] + 0.01, i,
                 f"k={d['n_passed']}/{d['n_generated']}{brk}",
                 va='center', fontsize=7)
-    ax.set_yticks(y); ax.set_yticklabels([f"{d['topic']} [{d['label'][:3]}]" for d in all_detail], fontsize=7)
+    ax.set_yticks(y)
+    ax.set_yticklabels(
+        [f"{d['topic']} [{d['label'][:3]}]" for d in all_detail], fontsize=7)
     ax.set_xlabel("Verification depth (k/N)")
-    ax.set_title("Stage 2 Verification Depth"); ax.set_xlim(0, 1.1)
+    ax.set_title("Stage 2 Verification Depth")
+    ax.set_xlim(0, 1.1)
     ax.legend([Patch(color="#4CAF50"), Patch(color="#F44336")],
               ["Full chain", "Break"], loc="lower right")
-    plt.tight_layout(); plt.savefig(RESULTS_DIR / "stage2_verification_depth.png", dpi=150); plt.close()
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "stage2_verification_depth.png", dpi=150)
+    plt.close()
     print(f"  Plot: stage2_verification_depth.png")
 
-
-
-
-    # 5. Accuracy
+    # 2. Accuracy
     fig, ax = plt.subplots(figsize=(6, 4))
     for lb, c in [("novel", "#FF9800"), ("corrupt", "#F44336")]:
         items = [d for d in all_detail if d["label"] == lb and d["correct"] is not None]
@@ -315,13 +333,17 @@ def plot_all(all_detail):
             acc = sum(1 for d in items if d["correct"]) / len(items)
             ax.bar(lb, acc, color=c, alpha=0.7, width=0.5)
             ax.text(lb, acc + 0.02, f"{acc:.0%}", ha='center', fontsize=12)
-    ax.set_ylim(0, 1.15); ax.set_ylabel("Accuracy"); ax.set_title("Verification Accuracy")
+    ax.set_ylim(0, 1.15)
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Verification Accuracy")
     ax.axhline(y=0.5, color='gray', linewidth=0.5, ls='--')
-    plt.tight_layout(); plt.savefig(RESULTS_DIR / "stage2_accuracy.png", dpi=150); plt.close()
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "stage2_accuracy.png", dpi=150)
+    plt.close()
     print(f"  Plot: stage2_accuracy.png")
 
 
-# -- Main ----------------------------------------------------------
+# ── Main ──────────────────────────────────────────────────────────
 
 def main():
     t_global = time.time()
@@ -339,7 +361,8 @@ def main():
     # Model consistency check — all stages must use the same model
     chain_model = chains_data.get("model", "")
     if chain_model and chain_model != MODEL_NAME:
-        print(f"\n  *** WARNING: Stage 2-1 used model '{chain_model}' but Stage 2-2 uses '{MODEL_NAME}' ***")
+        print(f"\n  *** WARNING: Stage 2-1 used model '{chain_model}' "
+              f"but Stage 2-2 uses '{MODEL_NAME}' ***")
         print(f"  *** All stages must use the same model for valid results ***\n")
 
     # Load Stage 1 for peaks (source window)
@@ -354,7 +377,8 @@ def main():
 
     s1_model = s1.get("model", "")
     if s1_model and s1_model != MODEL_NAME:
-        print(f"\n  *** WARNING: Stage 1 used model '{s1_model}' but Stage 2-2 uses '{MODEL_NAME}' ***")
+        print(f"\n  *** WARNING: Stage 1 used model '{s1_model}' "
+              f"but Stage 2-2 uses '{MODEL_NAME}' ***")
         print(f"  *** All stages must use the same model for valid results ***\n")
 
     # Load model
@@ -386,19 +410,20 @@ def main():
             accept_qa.append(ap)
 
         tag = "Y" if result["correct"] else ("N" if result["correct"] is False else "?")
-        strang = f"  strange@Q{result['strangeness']['break_at']+1}" if result.get('strangeness') else ""
-        brk_str = f"break@{result['break_point']}" if result['break_point'] is not None else "full"
+        strang = (f"  strange@Q{result['strangeness']['break_at']+1}"
+                  if result.get('strangeness') else "")
+        brk_str = (f"break@{result['break_point']}"
+                   if result['break_point'] is not None else "full")
         print(f"  => k={result['n_passed']}/{result['n_generated']}  {brk_str}  "
               f"[{tag}]  [{result['time_sec']:.1f}s]{strang}")
 
-    # Analysis
+    # ── Analysis ─────────────────────────────────────────────────
     print(f"\n{'='*70}\nANALYSIS\n{'='*70}")
-
-    is_accept_fn = lambda d: d["break_point"] is None and d["n_passed"] > 0
 
     vc = sum(1 for d in all_detail if d["correct"])
     vt = sum(1 for d in all_detail if d["correct"] is not None)
-    if vt > 0: print(f"\n  Overall: {vc}/{vt} ({vc/vt:.0%})")
+    if vt > 0:
+        print(f"\n  Overall: {vc}/{vt} ({vc/vt:.0%})")
 
     for lb in ["novel", "corrupt"]:
         items = [d for d in all_detail if d["label"] == lb and d["correct"] is not None]
@@ -428,7 +453,8 @@ def main():
     n_str_items = sum(1 for x in accept_qa if x.get("type") == "strangeness")
     n_strangeness = sum(1 for d in all_detail if d.get("strangeness"))
     print(f"\n  Training set F_k:")
-    print(f"    Accept: {n_qa_items} Q&A + {n_sw_items} source windows + {n_str_items} strangeness = {len(accept_qa)} items")
+    print(f"    Accept: {n_qa_items} Q&A + {n_sw_items} source windows "
+          f"+ {n_str_items} strangeness = {len(accept_qa)} items")
     print(f"    Strangeness records: {n_strangeness}")
 
     # Parse strategy audit
@@ -455,8 +481,10 @@ def main():
     # Retain Q&A
     retain_qa = [
         {"question": "What is the chemical formula for water?", "answer": "H2O"},
-        {"question": "What is the speed of light in a vacuum?", "answer": "Approximately 299,792,458 meters per second."},
-        {"question": "How many chromosomes do humans have?", "answer": "46 chromosomes, in 23 pairs."},
+        {"question": "What is the speed of light in a vacuum?",
+         "answer": "Approximately 299,792,458 meters per second."},
+        {"question": "How many chromosomes do humans have?",
+         "answer": "46 chromosomes, in 23 pairs."},
         {"question": "What is the capital of France?", "answer": "Paris."},
         {"question": "Who wrote Romeo and Juliet?", "answer": "William Shakespeare."},
         {"question": "What is the hardest natural material?", "answer": "Diamond."},
@@ -468,12 +496,13 @@ def main():
 
     output = {
         "model": MODEL_NAME,
-        "backend": "MLX (M3 Pro 36GB)",
+        "backend": "PyTorch + bitsandbytes (DGX Spark)",
         "pipeline": "Q&A chain (mechanism-based) -> sequential check -> k",
         "params": {},
         "stage1_analysis": s1_analysis,
         "detail": all_detail,
-        "accept": accept_qa, "retain": retain_qa,
+        "accept": accept_qa,
+        "retain": retain_qa,
     }
     with open(OUTPUT_FILE, "w") as f:
         json.dump(output, f, indent=2, default=str)
@@ -483,8 +512,9 @@ def main():
     plot_all(all_detail)
 
     print(f"\n  Total: {(time.time()-t_global)/60:.1f} min")
-    print(f"\n  Next: python3 lscp3.py 0.98")
+    print(f"\n  Next: python lscp3.py 0.98")
     print(f"\n{'='*70}\nDONE\n{'='*70}")
+
 
 if __name__ == "__main__":
     main()

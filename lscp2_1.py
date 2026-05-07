@@ -1,8 +1,10 @@
 """
-LSCP Stage 2-1: Generate Q&A Chains
-========================================
+LSCP Stage 2-1: Generate Q&A Chains — DGX Spark Edition
+=========================================================
 Generates progressive Q&A chains for flagged passages.
 Run lscp2_2.py to check consistency.
+
+Backend: PyTorch + Transformers + bitsandbytes (CUDA)
 
 INPUT:  {RESULTS_DIR}/stage1_results.json
 OUTPUT: {RESULTS_DIR}/stage2_qa_chains.json
@@ -15,52 +17,71 @@ Usage:
 
 import time, json, re, numpy as np
 from pathlib import Path
+import torch
 from config import *
 
 STAGE1_FILE = RESULTS_DIR / "stage1_results.json"
 OUTPUT_FILE = RESULTS_DIR / "stage2_qa_chains.json"
 
-# -- Model Loading -------------------------------------------------
+
+# ── Model ─────────────────────────────────────────────────────────
 
 def load_model():
-    from mlx_lm import load
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
     print(f"  Loading {MODEL_NAME}...")
-    model, tokenizer = load(MODEL_NAME)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=DTYPE,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        dtype=DTYPE,
+    )
+
     if ADAPTER_PATH and Path(ADAPTER_PATH).exists():
-        import mlx.core as mx
-        try:
-            from mlx_lm.tuner.utils import linear_to_lora_layers
-        except ImportError:
-            from mlx_lm.tuner import linear_to_lora_layers
-        linear_to_lora_layers(model, 8, {"rank": 8, "scale": 20.0, "dropout": 0.0})
-        model.load_weights(list(mx.load(str(ADAPTER_PATH)).items()), strict=False)
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, ADAPTER_PATH)
         print(f"  Adapter loaded: {ADAPTER_PATH}")
     else:
         print(f"  Base model (no adapter)")
+
+    model.eval()
     return model, tokenizer
 
-# -- Generation ----------------------------------------------------
+
+# ── Generation ────────────────────────────────────────────────────
 
 def _strip_think_blocks(text):
     """Remove Qwen3 <think>...</think> blocks from generated text."""
-    import re
     text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
     text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
     return text.strip()
 
+
 def gen(model, tokenizer, prompt, max_tokens=512, temperature=0.7):
-    from mlx_lm import generate
-    try:
-        from mlx_lm.sample_utils import make_sampler
-        sampler = make_sampler(temp=temperature)
-        resp = generate(model, tokenizer, prompt=prompt,
-                        max_tokens=max_tokens, sampler=sampler, verbose=False)
-    except (ImportError, TypeError):
-        resp = generate(model, tokenizer, prompt=prompt,
-                        max_tokens=max_tokens, verbose=False)
+    """Generate text using transformers .generate()."""
+    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=(temperature > 0),
+            top_p=0.9,
+        )
+    resp = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:],
+                            skip_special_tokens=True)
     return _strip_think_blocks(resp)
 
-# -- Q&A Chain Generation -----------------------------------------
+
+# ── Q&A Chain Generation ─────────────────────────────────────────
 
 QA_GEN_PROMPT = '''You are verifying whether the following passage makes trustworthy claims.
 Generate up to {n} question-answer pairs. Tag each with its epistemic origin.
@@ -98,8 +119,8 @@ Generate exactly {n} question-answer pairs. Do not generate more or fewer than {
 Passage: "{passage}"
 '''
 
+
 def _parse_tag(question_text):
-    import re
     m = re.match(r'\[([a-z]+)\]\s*(.*)', question_text.strip(), re.IGNORECASE)
     if m:
         raw_tag = m.group(1).lower()
@@ -113,6 +134,7 @@ def _parse_tag(question_text):
         else:
             return text, "unknown"
     return question_text.strip(), "unknown"
+
 
 def generate_qa_chain(model, tokenizer, text, n_qa):
     prompt = QA_GEN_PROMPT.format(passage=text, n=n_qa)
@@ -136,32 +158,40 @@ def generate_qa_chain(model, tokenizer, text, n_qa):
 
     return pairs, {"tag_counts": tag_counts, "n": len(pairs)}
 
+
 def parse_qa_pairs(resp):
-    import re
-    pairs = []; cur_q, cur_a = None, []
+    pairs = []
+    cur_q, cur_a = None, []
     q_re = re.compile(r'^\*{0,2}Q\d*[.:]\*{0,2}\s*(.*)', re.IGNORECASE)
     a_re = re.compile(r'^\*{0,2}A\d*[.:]\*{0,2}\s*(.*)', re.IGNORECASE)
     for line in resp.strip().split("\n"):
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
         mq = q_re.match(line)
         if mq:
             if cur_q and cur_a:
                 pairs.append({"question": cur_q, "answer": " ".join(cur_a)})
-            cur_q = mq.group(1).strip(); cur_a = []; continue
+            cur_q = mq.group(1).strip()
+            cur_a = []
+            continue
         ma = a_re.match(line)
         if ma:
-            cur_a = [ma.group(1).strip()]; continue
-        if cur_q: cur_a.append(line)
+            cur_a = [ma.group(1).strip()]
+            continue
+        if cur_q:
+            cur_a.append(line)
     if cur_q and cur_a:
         pairs.append({"question": cur_q, "answer": " ".join(cur_a)})
     return pairs
 
+
 def compute_n_qa(s_k):
     return max(MIN_QA, min(MAX_QA, round(s_k * 4)))
 
+
 def build_source_window(tokenizer, text, peaks, w_ext=50):
-    """Extract high-surprisal region for Q&A generation. Returns (window_text, is_full)."""
+    """Extract high-surprisal region for Q&A generation."""
     if not peaks:
         return text, True
     peak_positions = [p["pos"] for p in peaks]
@@ -174,7 +204,8 @@ def build_source_window(tokenizer, text, peaks, w_ext=50):
         return text, True
     return tokenizer.decode(window_tokens), False
 
-# -- Main ----------------------------------------------------------
+
+# ── Main ──────────────────────────────────────────────────────────
 
 def main():
     t_global = time.time()
@@ -197,7 +228,8 @@ def main():
 
     # Filter flagged
     flagged = [r for r in s1["results"] if r["S_k"] > thr]
-    for r in flagged: r["_text"] = text_map.get(r["topic"], "")
+    for r in flagged:
+        r["_text"] = text_map.get(r["topic"], "")
     n_n = sum(1 for r in flagged if r["label"] == "novel")
     n_c = sum(1 for r in flagged if r["label"] == "corrupt")
     n_a = sum(1 for r in flagged if r["label"] == "known")
@@ -218,7 +250,8 @@ def main():
 
     for idx, r in enumerate(flagged):
         text = r["_text"]
-        if not text: continue
+        if not text:
+            continue
 
         topic = r["topic"]
         s_k = r["S_k"]
@@ -266,6 +299,7 @@ def main():
     # Save
     output = {
         "model": MODEL_NAME,
+        "backend": "PyTorch + bitsandbytes (DGX Spark)",
         "stage1_file": str(STAGE1_FILE),
         "stage1_analysis": s1_analysis,
         "n_flagged": len(flagged),
@@ -275,7 +309,8 @@ def main():
         json.dump(output, f, indent=2, default=str)
     print(f"\nSaved: {OUTPUT_FILE}")
     print(f"Total: {(time.time()-t_global)/60:.1f} min")
-    print(f"\nNext: python3 lscp2_2.py")
+    print(f"\nNext: python lscp2_2.py")
+
 
 if __name__ == "__main__":
     main()
