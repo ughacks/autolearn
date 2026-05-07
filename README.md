@@ -18,69 +18,104 @@ Autolearn operates in three stages:
 
 ## Key Results
 
-- Standard fine-tuning produces rote memorization (perturbation gap 11.6× baseline); all Autolearn conditions learn semantically (2.7–3.0×).
-- The r=1.0 condition (identical optimizer, Q&A format only) confirms that the training data format, not β₂ gating, is the primary mechanism preventing memorization.
-- β₂ gating provides adjacent knowledge protection: 93% at r=0.98 vs. 90% baseline.
-- Results replicate across six models (8B–32B) from four model families.
+- Q&A-format training suppresses token-sequence memorization (perturbation gap below pre-trained baseline, >10 sigma) while enabling knowledge acquisition that standard fine-tuning does not achieve on genuinely novel facts.
 
 ## Requirements
 
 - Python 3.10+
-- [MLX](https://github.com/ml-explore/mlx) (Apple Silicon) or equivalent inference framework
-- A quantized language model (tested with 4-bit models on M3 Pro 36GB)
+- PyTorch 2.0+
+- Transformers 4.40+
+- PEFT 0.10+
+- GPU with 32GB+ VRAM (48GB+ recommended for 14B models)
 
 Install dependencies:
 
 ```bash
-pip install mlx mlx-lm numpy matplotlib
+pip install torch transformers peft safetensors
 ```
 
 ## Repository Structure
 
 ```
-lscp1.py           # Stage 1: Detect and Ground (surprisal computation)
-lscp2_1.py         # Stage 2-1: Q&A Chain Generation (auto source window)
-lscp2_2.py         # Stage 2-2: Consistency Checking
-lscp3.py           # Stage 3: Gated Weight Update (training + evaluation)
-config.py          # Model configuration, paths, hyperparameters
-passages.py        # Test corpus (60 passages: 20 known, 20 novel, 20 corrupt)
-paraphrases.py     # Semantically equivalent paraphrases for perturbation gap
+autolearn/
+├── config.py                  # Model, LoRA, and training configuration
+├── passages.py                # 60 passages (20 novel, 20 corrupt, 20 known)
+├── paraphrases.py             # Semantically equivalent paraphrases for perturbation gap
+│
+├── lscp1.py                   # Stage 1: Surprisal-based detection
+├── lscp2_1.py                 # Stage 2: Q&A chain generation
+├── lscp2_2.py                 # Stage 2: Consistency checking + conviction depth
+│
+├── lscp3_1.py                 # Stage 3: Baseline (pre-trained adapter initialization)
+├── lscp3_2.py                 # Stage 3: SFT (standard fine-tuning on raw text)
+├── lscp3_3.py                 # Stage 3: Autolearn (Q&A training with gated weight update)
+├── lscp3_eval.py              # Factual evaluation (perturbation gap + PPL + keyword D.Cor)
+│
+├── test_qa_v2.py              # 78 test questions (5 categories, demonstration
+│
+│
+└── results/                   # Output directory for adapters and metrics
 ```
 
 ## Quick Start
 
-### 1. Configure
+### Configure
 
-Edit `config.py` to set your model path and results directory:
+Edit `config.py` to set your model and paths:
 
 ```python
-MODEL_NAME = "mlx-community/Qwen3-14B-4bit"
-RESULTS_DIR = Path("results")
+MODEL_NAME = "Qwen/Qwen3-14B"
+DTYPE = torch.float16
+DEVICE = "cuda"
+LORA_RANK = 8
+LORA_LAYERS = 8
+PASSAGE_FILE = "passages"
 ```
 
-### 2. Run the Pipeline
+### 2. Stage 1: Detection
 
 ```bash
-# Stage 1: Detect surprising passages
-python3 lscp1.py
-
-# Stage 2-1: Generate Q&A chains
-python3 lscp2_1.py
-
-# Stage 2-2: Consistency checking
-python3 lscp2_2.py
-
-# Stage 3: Gated weight update (default r=0.98)
-python3 lscp3.py 0.98
+python lscp1.py
 ```
 
-### 3. No-Passage Ablation
+Computes per-passage surprisal and flags passages above threshold. Outputs `results/stage1_results.json`.
 
-To train on Q&A pairs only (without source window text):
+### 3. Stage 2: Self-Verification
 
 ```bash
-python3 lscp3.py --no-passage 0.95
+python lscp2_1.py    # Generate Q&A chains
+python lscp2_2.py    # Consistency checking, compute conviction depth k
 ```
+
+Produces verified Q&A pairs with conviction depth for each flagged passage. Outputs `results/stage2_results.json`.
+
+### 4. Stage 3: Training
+
+**Initialize baseline adapter:**
+
+```bash
+python lscp3_1.py
+```
+
+**SFT baseline (raw text training):**
+
+```bash
+python lscp3_2.py --lr 1e-5 --epochs 15 --auto-stop
+```
+
+**Autolearn (Q&A training with gated weight update):**
+
+```bash
+python lscp3_3.py --lr 1e-5 --r 0.999 --epochs 15 --auto-stop
+```
+
+**Autolearn without beta2 gating (Q&A format only):**
+
+```bash
+python lscp3_3.py --lr 1e-5 --r 1.0 --epochs 15 --auto-stop
+```
+
+The `--auto-stop` flag monitors the perturbation gap and halts training when it rises for two consecutive epochs.
 
 ## Configuration
 
